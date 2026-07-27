@@ -1,0 +1,27 @@
+# Python virtual environment
+.venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Uploaded and generated files
+uploads/*
+output/*
+test_documents/*
+
+# Keep empty directories
+!uploads/.gitkeep
+!output/.gitkeep
+!test_documents/.gitkeep
+
+# Environment configuration
+.env
+
+# IDE
+.vscode/
+.idea/
+
+# Operating system
+Thumbs.db
+.DS_Store
