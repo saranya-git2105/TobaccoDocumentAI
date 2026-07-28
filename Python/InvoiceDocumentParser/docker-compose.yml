@@ -1,0 +1,13 @@
+services:
+  invoice-document-parser:
+    build:
+      context: .
+    ports:
+      - "4004:8000"
+    volumes:
+      - ./uploads:/app/uploads
+      - paddleocr-models:/root/.paddlex
+    restart: unless-stopped
+
+volumes:
+  paddleocr-models:
