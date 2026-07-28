@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import time
 from pathlib import Path
 from threading import Lock
@@ -121,6 +122,14 @@ class OcrService:
                 )
 
             refine_elapsed = time.perf_counter() - refine_started
+
+        tbgr_refine_started = time.perf_counter()
+        document = self._refine_missing_tbgr_cells(
+            image,
+            items,
+            document,
+        )
+        refine_elapsed += time.perf_counter() - tbgr_refine_started
 
         inference_time = time.perf_counter() - start_time
         print(
@@ -472,6 +481,227 @@ class OcrService:
             )
         ]
         return outside_table_body + refined_items
+
+    def _refine_missing_tbgr_cells(
+        self,
+        image: Any,
+        items: list[dict[str, Any]],
+        document: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Re-OCR only missing TBGR cells at high resolution."""
+        missing_serials = {
+            int(row["serial_number"])
+            for row in document.get("items", [])
+            if row.get("serial_number") is not None
+            and not str(row.get("tbgr_number", "")).strip()
+        }
+
+        if image is None or not missing_serials:
+            return document
+
+        height, width = image.shape[:2]
+        header_bottom = self._find_table_header_bottom(items)
+        serials = self._find_serial_anchors(
+            items,
+            width,
+            header_bottom,
+        )
+
+        if len(serials) < 2:
+            return document
+
+        centers = self._complete_row_centers(serials)
+        left, right = self._find_tbgr_column_bounds(
+            items,
+            width,
+            str(
+                (document.get("extraction_meta") or {}).get(
+                    "layout",
+                    "",
+                )
+            ),
+        )
+        ordered_centers = sorted(centers.items())
+        prepared: list[tuple[int, list[Any]]] = []
+
+        for index, (serial, center) in enumerate(ordered_centers):
+            if serial not in missing_serials:
+                continue
+
+            previous_center = (
+                ordered_centers[index - 1][1]
+                if index > 0
+                else center - (
+                    ordered_centers[index + 1][1] - center
+                )
+            )
+            next_center = (
+                ordered_centers[index + 1][1]
+                if index + 1 < len(ordered_centers)
+                else center + (
+                    center - ordered_centers[index - 1][1]
+                )
+            )
+            top = max(int((previous_center + center) / 2), 0)
+            bottom = min(int((center + next_center) / 2), height)
+
+            if bottom - top < 6 or right - left < 8:
+                continue
+
+            crop = image[top:bottom, left:right]
+            enlarged = cv2.resize(
+                crop,
+                None,
+                fx=4.0,
+                fy=4.0,
+                interpolation=cv2.INTER_CUBIC,
+            )
+            gray = cv2.cvtColor(enlarged, cv2.COLOR_BGR2GRAY)
+            _, binary = cv2.threshold(
+                gray,
+                0,
+                255,
+                cv2.THRESH_BINARY + cv2.THRESH_OTSU,
+            )
+            binary_bgr = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
+            prepared.append((serial, [enlarged, binary_bgr]))
+
+        if not prepared:
+            return document
+
+        flat_crops = [
+            crop
+            for _, variants in prepared
+            for crop in variants
+        ]
+        predictions = self._predict(flat_crops)
+
+        if len(predictions) != len(flat_crops):
+            return document
+
+        prefixes = DeliveryNoteExtractor._collect_tbgr_prefixes(
+            document.get("items", [])
+        )
+        recovered: dict[int, str] = {}
+        prediction_index = 0
+
+        for serial, variants in prepared:
+            variant_results = predictions[
+                prediction_index : prediction_index + len(variants)
+            ]
+            prediction_index += len(variants)
+            candidate = self._select_tbgr_candidate(
+                variant_results,
+                prefixes,
+            )
+
+            if candidate:
+                recovered[serial] = candidate
+
+        if not recovered:
+            return document
+
+        for row in document.get("items", []):
+            serial_number = row.get("serial_number")
+
+            if serial_number in recovered:
+                row["tbgr_number"] = recovered[int(serial_number)]
+
+        document["items"] = DeliveryNoteExtractor._postprocess_rows(
+            document.get("items", [])
+        )
+        document["extraction_meta"] = (
+            DeliveryNoteExtractor._build_extraction_meta(
+                document["items"],
+                layout_name=(
+                    document.get("extraction_meta") or {}
+                ).get("layout", "unknown"),
+                totals=document.get("totals"),
+            )
+        )
+        return document
+
+    @staticmethod
+    def _find_tbgr_column_bounds(
+        items: list[dict[str, Any]],
+        width: int,
+        layout_name: str,
+    ) -> tuple[int, int]:
+        tbgr_box: list[Any] | None = None
+        grower_box: list[Any] | None = None
+
+        for item in items:
+            text = "".join(
+                character
+                for character in str(item.get("text", "")).lower()
+                if character.isalnum()
+            )
+            box = item.get("boundingBox", [])
+
+            if not box:
+                continue
+
+            if tbgr_box is None and "tbgr" in text:
+                tbgr_box = box
+            if grower_box is None and (
+                "growername" in text
+                or "nameofthegrower" in text
+            ):
+                grower_box = box
+
+        if tbgr_box and grower_box and tbgr_box is not grower_box:
+            tbgr_left = min(float(point[0]) for point in tbgr_box)
+            grower_left = min(float(point[0]) for point in grower_box)
+            left = max(int(tbgr_left - (width * 0.015)), 0)
+            right = min(int(grower_left - (width * 0.005)), width)
+
+            if right - left >= width * 0.035:
+                return left, right
+
+        if layout_name == "wide":
+            return int(width * 0.045), int(width * 0.17)
+
+        return int(width * 0.08), int(width * 0.23)
+
+    @classmethod
+    def _select_tbgr_candidate(
+        cls,
+        results: list[Any],
+        prefixes: list[str],
+    ) -> str:
+        candidates: list[tuple[float, str]] = []
+
+        for item in cls._results_to_items(results):
+            text = str(item.get("text", ""))
+            confidence = float(item.get("confidence", 0.0))
+
+            for digit_group in re.findall(r"\d+", text):
+                if len(digit_group) == 8:
+                    candidates.append((confidence, digit_group))
+                elif 8 < len(digit_group) <= 10:
+                    # A tight crop can join the one- or two-digit serial to
+                    # the TBGR number; the registration number is the last
+                    # eight digits in that reading.
+                    candidates.append((confidence - 0.02, digit_group[-8:]))
+
+            recovered = DeliveryNoteExtractor._recover_tbgr_from_text(
+                text,
+                prefixes,
+            )
+
+            if recovered:
+                candidates.append((confidence - 0.05, recovered))
+
+        if not candidates:
+            return ""
+
+        valid_prefixes = set(prefixes)
+        prefixed = [
+            candidate
+            for candidate in candidates
+            if not valid_prefixes or candidate[1][:3] in valid_prefixes
+        ]
+        return max(prefixed or candidates, key=lambda value: value[0])[1]
 
     @staticmethod
     def _merge_documents(

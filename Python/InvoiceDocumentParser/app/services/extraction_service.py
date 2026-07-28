@@ -750,15 +750,22 @@ class DeliveryNoteExtractor:
             and 1 <= int(token.text.strip()) <= 60
         ]
 
-        if not serial_tokens:
-            return []
-
         column_ranges = cls._build_column_ranges(
             headers,
             page_width,
             layout_name=resolved_layout,
         )
         serial_tokens = cls._dedupe_serial_tokens(serial_tokens)
+        serial_tokens = cls._supplement_serials_from_lot_rows(
+            serial_tokens,
+            body_tokens,
+            page_width,
+            column_ranges,
+        )
+
+        if not serial_tokens:
+            return []
+
         serial_tokens.sort(key=lambda token: token.center_y)
         serial_tokens = cls._complete_serial_tokens(serial_tokens)
         row_assignments = cls._assign_tokens_to_serial_rows(
@@ -801,6 +808,106 @@ class DeliveryNoteExtractor:
                 best_by_serial[serial_number] = token
 
         return list(best_by_serial.values())
+
+    @staticmethod
+    def _supplement_serials_from_lot_rows(
+        serial_tokens: list[_Token],
+        body_tokens: list[_Token],
+        page_width: float,
+        column_ranges: dict[str, tuple[float, float]],
+    ) -> list[_Token]:
+        """Recover row anchors from lot numbers when serial glyphs are missed."""
+        if not serial_tokens:
+            return serial_tokens
+
+        lot_start, lot_end = column_ranges["lot"]
+        lot_tokens = sorted(
+            (
+                token
+                for token in body_tokens
+                if lot_start <= token.center_x / page_width < lot_end
+                and re.fullmatch(r"\d{4,6}", token.text.strip())
+            ),
+            key=lambda token: token.center_y,
+        )
+
+        if len(lot_tokens) < 2:
+            return serial_tokens
+
+        # Keep one lot anchor per visual row.
+        deduped_lots: list[_Token] = []
+
+        for token in lot_tokens:
+            if (
+                deduped_lots
+                and abs(token.center_y - deduped_lots[-1].center_y)
+                <= max(token.height, deduped_lots[-1].height) * 0.45
+            ):
+                if token.confidence > deduped_lots[-1].confidence:
+                    deduped_lots[-1] = token
+                continue
+
+            deduped_lots.append(token)
+
+        base_candidates: list[int] = []
+
+        for serial in serial_tokens:
+            nearest_index, nearest_lot = min(
+                enumerate(deduped_lots),
+                key=lambda value: abs(
+                    value[1].center_y - serial.center_y
+                ),
+            )
+
+            if (
+                abs(nearest_lot.center_y - serial.center_y)
+                <= max(nearest_lot.height, serial.height) * 1.5
+            ):
+                base_candidates.append(
+                    int(serial.text) - nearest_index
+                )
+
+        if not base_candidates:
+            return serial_tokens
+
+        first_serial, votes = Counter(base_candidates).most_common(1)[0]
+
+        # Conflicting anchors indicate that the lot column was misidentified;
+        # retain the original serials instead of inventing rows.
+        if votes * 2 <= len(base_candidates):
+            return serial_tokens
+
+        existing_numbers = {
+            int(token.text)
+            for token in serial_tokens
+        }
+        template = max(
+            serial_tokens,
+            key=lambda token: token.confidence,
+        )
+        supplemented = list(serial_tokens)
+
+        for index, lot_token in enumerate(deduped_lots):
+            serial_number = first_serial + index
+
+            if (
+                serial_number in existing_numbers
+                or not 1 <= serial_number <= 60
+            ):
+                continue
+
+            supplemented.append(
+                _Token(
+                    text=str(serial_number),
+                    confidence=0.0,
+                    left=template.left,
+                    top=lot_token.center_y - (template.height / 2),
+                    right=template.right,
+                    bottom=lot_token.center_y + (template.height / 2),
+                )
+            )
+
+        return supplemented
 
     @classmethod
     def _assign_tokens_to_serial_rows(
@@ -1114,7 +1221,16 @@ class DeliveryNoteExtractor:
             if column == "left":
                 name_part = cls._extract_name_part(
                     token.text,
-                    include_name=relative_x < ranges["grower"][1],
+                    include_name=(
+                        relative_x < ranges["grower"][1]
+                        and not (
+                            relative_x < 0.09
+                            and len(
+                                re.sub(r"[^A-Za-z]", "", token.text)
+                            )
+                            <= 2
+                        )
+                    ),
                 )
                 cls._merge_left_columns(
                     item,
@@ -2084,6 +2200,37 @@ class DeliveryNoteExtractor:
             bool(re.search(r"(?:APV|PPLB|PLB|AP)$", name, re.IGNORECASE))
             for name in names
         )
+        rows_by_tbgr: dict[str, list[dict[str, Any]]] = defaultdict(list)
+
+        for row in rows:
+            tbgr_number = str(row.get("tbgr_number", "")).strip()
+
+            if re.fullmatch(r"\d{8}", tbgr_number):
+                rows_by_tbgr[tbgr_number].append(row)
+
+        # On a short crop, stronger marker variants may be outside the image.
+        # Three differing readings of one grower that all end in P provide
+        # enough local evidence that P is the attached handwritten stroke.
+        for repeated_rows in rows_by_tbgr.values():
+            repeated_names = [
+                str(row.get("grower_name", "")).strip()
+                for row in repeated_rows
+            ]
+
+            if (
+                len(repeated_names) >= 3
+                and len(set(repeated_names)) > 1
+                and all(
+                    re.search(r"(?<=[A-Za-z]{5})P$", name)
+                    for name in repeated_names
+                )
+            ):
+                for row in repeated_rows:
+                    row["grower_name"] = re.sub(
+                        r"P$",
+                        "",
+                        str(row.get("grower_name", "")).strip(),
+                    )
 
         if strong_marker_count < 2:
             return
