@@ -16,6 +16,10 @@ from app.services.image_service import ImageService
 class OcrService:
     _instance: PaddleOCR | None = None
     _initialization_lock = Lock()
+    # PaddleOCR keeps mutable predictor state and is not safe to call from
+    # multiple FastAPI worker threads at once. Serializing prediction prevents
+    # overlapping uploads from dropping or combining table rows.
+    _prediction_lock = Lock()
     _DET_LIMIT_SIDE_LEN = 1280
     _REFINEMENT_FIELDS = (
         "tbgr_number",
@@ -68,12 +72,13 @@ class OcrService:
         return cls._instance
 
     def _predict(self, input_data: Any) -> list[Any]:
-        return list(
-            self._ocr.predict(
-                input_data,
-                text_det_limit_side_len=self._DET_LIMIT_SIDE_LEN,
+        with self._prediction_lock:
+            return list(
+                self._ocr.predict(
+                    input_data,
+                    text_det_limit_side_len=self._DET_LIMIT_SIDE_LEN,
+                )
             )
-        )
 
     def extract_text(self, image_path: Path) -> dict[str, Any]:
         if not image_path.exists():
@@ -249,6 +254,11 @@ class OcrService:
         ):
             return True
 
+        if DeliveryNoteExtractor._grower_name_needs_refinement(
+            str(row.get("grower_name", ""))
+        ):
+            return True
+
         missing_fields = sum(
             1
             for field in cls._REFINEMENT_FIELDS
@@ -371,6 +381,11 @@ class OcrService:
                 row_document.get(field) in ("", None)
                 for field in self._CRITICAL_ROW_FIELDS
             )
+            needs_name_refinement = (
+                DeliveryNoteExtractor._grower_name_needs_refinement(
+                    str(row_document.get("grower_name", ""))
+                )
+            )
             missing_numeric_columns = any(
                 row_document.get(field) in ("", None)
                 for field in (
@@ -381,7 +396,9 @@ class OcrService:
                     "bale_value",
                 )
             )
-            use_full_row = missing_numeric_columns or not missing_left_columns
+            use_full_row = missing_numeric_columns or not (
+                missing_left_columns or needs_name_refinement
+            )
             crop = (
                 image[top:bottom, :]
                 if use_full_row
@@ -391,7 +408,7 @@ class OcrService:
             # missing one warrants a larger crop than a missing numeric cell.
             row_scale = (
                 3.0
-                if missing_left_columns
+                if missing_left_columns or needs_name_refinement
                 else 2.0
                 if missing_numeric_columns
                 else (1.5 if width < 1600 else 1.0)
@@ -442,12 +459,17 @@ class OcrService:
                     if top <= self._item_center_y(item) < bottom
                 )
 
-        body_top = min(top for _, top, _, _, _, _ in prepared_crops)
-        body_bottom = max(bottom for _, _, bottom, _, _, _ in prepared_crops)
+        refined_bounds = [
+            (top, bottom)
+            for _, top, bottom, _, _, _ in prepared_crops
+        ]
         outside_table_body = [
             item
             for item in items
-            if not body_top <= self._item_center_y(item) < body_bottom
+            if not any(
+                top <= self._item_center_y(item) < bottom
+                for top, bottom in refined_bounds
+            )
         ]
         return outside_table_body + refined_items
 
@@ -485,11 +507,9 @@ class OcrService:
             original_name = str(merged.get("grower_name", ""))
             refined_name = str(fallback.get("grower_name", ""))
 
-            if (
-                refined_name
-                and len(original_name.replace(" ", "")) > 35
-                and len(refined_name.replace(" ", ""))
-                < len(original_name.replace(" ", ""))
+            if DeliveryNoteExtractor._prefer_refined_grower_name(
+                original_name,
+                refined_name,
             ):
                 merged["grower_name"] = refined_name
 

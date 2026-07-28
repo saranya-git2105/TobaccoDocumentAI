@@ -48,6 +48,14 @@ class DeliveryNoteExtractor:
         r"\b(?:AP2?|MP2?|AF2?|R2?|LIST|L1ST|L2B|L3A|L1A|L2A|L1B)\/?\d*\b",
         re.IGNORECASE,
     )
+    # The handwritten row markers are sometimes joined to the final printed
+    # name by OCR. These endings are evidence that the name needs a focused
+    # second pass; they are not removed blindly because a short ending such as
+    # "AP" can also be part of a genuine name (for example, PRATAP).
+    _ATTACHED_HANDWRITING_SUFFIX = re.compile(
+        r"(?:APV?|MPV?|AFV?|PPLB|PLB|PL|R[1-3]|L[1-4][A-Z]{0,2})$",
+        re.IGNORECASE,
+    )
     _DELIVERY_NOTE_PATTERN = re.compile(
         r"\d{1,3}/\d{12,}[A-Z]?",
     )
@@ -1017,10 +1025,22 @@ class DeliveryNoteExtractor:
     def _complete_serial_tokens(
         serial_tokens: list[_Token],
     ) -> list[_Token]:
-        """Add row anchors when OCR misses a serial in a short sequence."""
+        """Add row anchors when OCR misses a short sequence of serials."""
         if len(serial_tokens) < 2:
             return serial_tokens
 
+        observed_row_steps = [
+            (right.center_y - left.center_y)
+            / (int(right.text) - int(left.text))
+            for left, right in zip(serial_tokens, serial_tokens[1:])
+            if 0 < int(right.text) - int(left.text) <= 6
+            and right.center_y > left.center_y
+        ]
+        typical_row_step = (
+            median(observed_row_steps)
+            if observed_row_steps
+            else None
+        )
         completed: list[_Token] = []
 
         for left, right in zip(serial_tokens, serial_tokens[1:]):
@@ -1029,10 +1049,23 @@ class DeliveryNoteExtractor:
             right_number = int(right.text)
             gap = right_number - left_number
 
-            if not 1 < gap <= 2:
+            if not 1 < gap <= 6:
                 continue
 
             y_step = (right.center_y - left.center_y) / gap
+
+            if (
+                y_step <= 0
+                or (
+                    typical_row_step is not None
+                    and not (
+                        typical_row_step * 0.65
+                        <= y_step
+                        <= typical_row_step * 1.45
+                    )
+                )
+            ):
+                continue
 
             for offset in range(1, gap):
                 center_y = left.center_y + (y_step * offset)
@@ -1517,6 +1550,7 @@ class DeliveryNoteExtractor:
         for row in rows:
             cls._repair_underweight_row(row)
             cls._reconcile_row_numerics(row)
+        cls._strip_attached_handwriting_markers(rows)
         cls._restore_grower_name_spacing(rows)
         cls._agree_grower_names_by_tbgr(rows)
 
@@ -1627,17 +1661,76 @@ class DeliveryNoteExtractor:
             )
             letters, votes = letter_counts.most_common(1)[0]
 
-            if votes * 2 <= len(names):
+            if votes * 2 > len(names):
+                variants = [
+                    name
+                    for name in names
+                    if re.sub(r"[^A-Za-z]", "", name).upper() == letters
+                ]
+                agreed[tbgr_number] = max(
+                    variants,
+                    key=lambda name: (len(name.split()), -len(name)),
+                )
                 continue
 
-            variants = [
-                name
+            # Three or more readings of one TBGR can repair a handwritten
+            # suffix without any external grower database. Keep the common
+            # prefix, then extend it only while a strict character majority
+            # agrees. This turns SHEKARPL / SHEKAP / SHEKARF into SHEKAR, but
+            # deliberately does nothing for a one-off or two-way conflict.
+            if len(names) < 3:
+                continue
+
+            compact = [
+                re.sub(r"[^A-Za-z]", "", name).upper()
                 for name in names
-                if re.sub(r"[^A-Za-z]", "", name).upper() == letters
             ]
-            agreed[tbgr_number] = max(
-                variants,
+            common_length = 0
+
+            for characters in zip(*compact):
+                if len(set(characters)) != 1:
+                    break
+                common_length += 1
+
+            consensus = compact[0][:common_length]
+            position = common_length
+
+            while position < max(map(len, compact)):
+                counts = Counter(
+                    value[position]
+                    for value in compact
+                    if position < len(value)
+                )
+
+                if not counts:
+                    break
+
+                character, count = counts.most_common(1)[0]
+
+                if count * 2 <= len(compact):
+                    break
+
+                consensus += character
+                position += 1
+
+            if (
+                len(consensus) < 8
+                or len(consensus) < min(map(len, compact)) * 0.8
+            ):
+                continue
+
+            consensus_variants = [
+                name
+                for name, value in zip(names, compact)
+                if value.startswith(consensus)
+            ]
+            base = max(
+                consensus_variants or names,
                 key=lambda name: (len(name.split()), -len(name)),
+            )
+            agreed[tbgr_number] = cls._truncate_name_letters(
+                base,
+                len(consensus),
             )
 
         for row in rows:
@@ -1653,10 +1746,102 @@ class DeliveryNoteExtractor:
                 str(row.get("grower_name", "")),
             ).upper()
 
-            # Only respace readings that agree on the letters, so a genuinely
-            # different reading is never overwritten by another row's.
-            if letters == re.sub(r"[^A-Za-z]", "", agreed_name).upper():
+            agreed_letters = re.sub(
+                r"[^A-Za-z]",
+                "",
+                agreed_name,
+            ).upper()
+            shared_prefix = 0
+
+            for left, right in zip(letters, agreed_letters):
+                if left != right:
+                    break
+                shared_prefix += 1
+
+            # Exact readings are only respaced. A longer reading may also be
+            # replaced when the agreed name is its prefix, which is the shape
+            # produced by a handwritten suffix joined to the printed name.
+            if (
+                letters == agreed_letters
+                or (
+                    letters.startswith(agreed_letters)
+                    and len(letters) - len(agreed_letters) <= 4
+                )
+                or (
+                    abs(len(letters) - len(agreed_letters)) <= 4
+                    and shared_prefix >= min(
+                        len(letters),
+                        len(agreed_letters),
+                    ) * 0.85
+                )
+            ):
                 row["grower_name"] = agreed_name
+
+    @staticmethod
+    def _truncate_name_letters(name: str, letter_count: int) -> str:
+        kept: list[str] = []
+        seen = 0
+
+        for character in name:
+            if character.isalpha():
+                if seen >= letter_count:
+                    break
+                seen += 1
+            kept.append(character)
+
+        return "".join(kept).strip()
+
+    @classmethod
+    def _grower_name_needs_refinement(cls, name: str) -> bool:
+        normalized = re.sub(r"\s+", " ", str(name)).strip()
+        compact = re.sub(r"[^A-Za-z]", "", normalized)
+
+        if len(compact) < 4:
+            return True
+
+        final_word = normalized.split()[-1] if normalized.split() else ""
+        return bool(
+            cls._ATTACHED_HANDWRITING_SUFFIX.search(final_word)
+            or len(compact) > 35
+        )
+
+    @classmethod
+    def _prefer_refined_grower_name(
+        cls,
+        original: str,
+        refined: str,
+    ) -> bool:
+        original = str(original).strip()
+        refined = str(refined).strip()
+
+        if not refined:
+            return False
+        if not original:
+            return True
+
+        original_letters = re.sub(r"[^A-Za-z]", "", original).upper()
+        refined_letters = re.sub(r"[^A-Za-z]", "", refined).upper()
+
+        if len(refined_letters) < 4:
+            return False
+
+        original_suspicious = cls._grower_name_needs_refinement(original)
+        refined_suspicious = cls._grower_name_needs_refinement(refined)
+
+        if original_suspicious and not refined_suspicious:
+            return (
+                original_letters.startswith(refined_letters)
+                and len(original_letters) - len(refined_letters) <= 5
+            )
+
+        return (
+            len(original_letters) > 35
+            and len(refined_letters) < len(original_letters)
+            and (
+                original_letters.startswith(refined_letters)
+                or refined_letters.startswith(original_letters)
+            )
+        )
 
     @classmethod
     def _segment_grower_name(
@@ -1878,6 +2063,83 @@ class DeliveryNoteExtractor:
 
             if rebuilt_name:
                 row["grower_name"] = rebuilt_name
+
+    @classmethod
+    def _strip_attached_handwriting_markers(
+        cls,
+        rows: list[dict[str, Any]],
+    ) -> None:
+        """Remove row-list marks that OCR joined to the printed grower name.
+
+        Short endings such as AP or P are stripped only when several stronger
+        marker readings on the same note establish that handwriting is present.
+        A lone final P additionally requires the same TBGR on at least three
+        rows, preventing ordinary one-off names from being shortened.
+        """
+        names = [
+            str(row.get("grower_name", "")).strip()
+            for row in rows
+        ]
+        strong_marker_count = sum(
+            bool(re.search(r"(?:APV|PPLB|PLB|AP)$", name, re.IGNORECASE))
+            for name in names
+        )
+
+        if strong_marker_count < 2:
+            return
+
+        tbgr_counts = Counter(
+            str(row.get("tbgr_number", "")).strip()
+            for row in rows
+            if re.fullmatch(
+                r"\d{8}",
+                str(row.get("tbgr_number", "")).strip(),
+            )
+        )
+
+        for row in rows:
+            name = str(row.get("grower_name", "")).strip()
+
+            if not name:
+                continue
+
+            # The printed RAO ending is frequently fused with a PPLB marker,
+            # with its O becoming the first stroke of the handwritten suffix.
+            cleaned = re.sub(
+                r"RAPPLB$",
+                "RAO",
+                name,
+                flags=re.IGNORECASE,
+            )
+            cleaned = re.sub(
+                r"(?:APV|PPLB|PLB)$",
+                "",
+                cleaned,
+                flags=re.IGNORECASE,
+            )
+
+            if cleaned == name:
+                cleaned = re.sub(
+                    r"AP$",
+                    "",
+                    cleaned,
+                    flags=re.IGNORECASE,
+                )
+
+            tbgr_number = str(row.get("tbgr_number", "")).strip()
+
+            if (
+                cleaned == name
+                and tbgr_counts.get(tbgr_number, 0) >= 3
+            ):
+                cleaned = re.sub(
+                    r"(?<=[A-Za-z]{5})P$",
+                    "",
+                    cleaned,
+                    flags=re.IGNORECASE,
+                )
+
+            row["grower_name"] = cleaned.strip() or name
 
     @staticmethod
     def _collect_tbgr_prefixes(rows: list[dict[str, Any]]) -> list[str]:
@@ -2489,11 +2751,16 @@ class DeliveryNoteExtractor:
 
         for row in rows:
             missing_fields: list[str] = []
+            uncertain_fields: list[str] = []
 
             if not row.get("tbgr_number"):
                 missing_fields.append("tbgr_number")
             if not row.get("grower_name"):
                 missing_fields.append("grower_name")
+            elif cls._grower_name_needs_refinement(
+                str(row.get("grower_name", ""))
+            ):
+                uncertain_fields.append("grower_name")
             if row.get("rate_per_kg") is None:
                 missing_fields.append("rate_per_kg")
             if row.get("bale_value") is None:
@@ -2501,13 +2768,16 @@ class DeliveryNoteExtractor:
             if row.get("weight") is None:
                 missing_fields.append("weight")
 
-            if missing_fields:
-                issue_rows.append(
-                    {
-                        "serial_number": row.get("serial_number"),
-                        "missing_fields": missing_fields,
-                    }
-                )
+            if missing_fields or uncertain_fields:
+                issue = {
+                    "serial_number": row.get("serial_number"),
+                    "missing_fields": missing_fields,
+                }
+
+                if uncertain_fields:
+                    issue["uncertain_fields"] = uncertain_fields
+
+                issue_rows.append(issue)
             elif (
                 row.get("tbgr_number")
                 and row.get("grower_name")
