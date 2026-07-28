@@ -27,6 +27,8 @@ class ImageService:
     # consistent across JPG, PNG, PDF, and camera photos.
     CANONICAL_OCR_WIDTH = 1400
     CANONICAL_OCR_MAX_HEIGHT = 2200
+    PDF_OCR_WIDTH = 2400
+    PDF_OCR_MAX_HEIGHT = 3600
 
     @classmethod
     def is_pdf(cls, path: Path) -> bool:
@@ -83,6 +85,120 @@ class ImageService:
             )
         finally:
             doc.close()
+
+    @staticmethod
+    def extract_pdf_text_items(
+        source_path: Path,
+        *,
+        target_width: int,
+        target_height: int,
+    ) -> list[dict[str, Any]]:
+        """Return positioned words from a PDF's native text layer.
+
+        Coordinates are converted from the PDF's bottom-left origin to the
+        top-left pixel coordinates used by the OCR pipeline. Scanned PDFs have
+        no character layer and naturally return an empty list.
+        """
+        if not ImageService.is_pdf(source_path):
+            return []
+
+        document = pdfium.PdfDocument(str(source_path))
+
+        try:
+            if len(document) == 0:
+                return []
+
+            page = document[0]
+            text_page = page.get_textpage()
+
+            try:
+                page_width, page_height = page.get_size()
+
+                if page_width <= 0 or page_height <= 0:
+                    return []
+
+                x_scale = target_width / page_width
+                y_scale = target_height / page_height
+                words: list[dict[str, Any]] = []
+                characters: list[
+                    tuple[str, tuple[float, float, float, float]]
+                ] = []
+
+                def flush_word() -> None:
+                    if not characters:
+                        return
+
+                    text = "".join(character for character, _ in characters)
+                    text = " ".join(text.split())
+
+                    if text:
+                        left = min(box[0] for _, box in characters)
+                        bottom = min(box[1] for _, box in characters)
+                        right = max(box[2] for _, box in characters)
+                        top = max(box[3] for _, box in characters)
+                        pixel_left = left * x_scale
+                        pixel_right = right * x_scale
+                        pixel_top = (page_height - top) * y_scale
+                        pixel_bottom = (page_height - bottom) * y_scale
+                        words.append(
+                            {
+                                "text": text,
+                                "confidence": 1.0,
+                                "boundingBox": [
+                                    [pixel_left, pixel_top],
+                                    [pixel_right, pixel_top],
+                                    [pixel_right, pixel_bottom],
+                                    [pixel_left, pixel_bottom],
+                                ],
+                            }
+                        )
+
+                    characters.clear()
+
+                for index in range(text_page.count_chars()):
+                    character = text_page.get_text_range(index, 1)
+
+                    try:
+                        box = text_page.get_charbox(index)
+                    except Exception:
+                        flush_word()
+                        continue
+
+                    if not character or character.isspace():
+                        flush_word()
+                        continue
+
+                    if characters:
+                        previous_box = characters[-1][1]
+                        previous_height = max(
+                            previous_box[3] - previous_box[1],
+                            1.0,
+                        )
+                        current_height = max(box[3] - box[1], 1.0)
+                        vertical_shift = abs(
+                            ((box[1] + box[3]) / 2)
+                            - ((previous_box[1] + previous_box[3]) / 2)
+                        )
+                        horizontal_gap = box[0] - previous_box[2]
+
+                        if (
+                            vertical_shift
+                            > max(previous_height, current_height) * 0.65
+                            or horizontal_gap
+                            > max(previous_height, current_height) * 0.8
+                            or horizontal_gap
+                            < -max(previous_height, current_height)
+                        ):
+                            flush_word()
+
+                    characters.append((character, box))
+
+                flush_word()
+                return words
+            finally:
+                text_page.close()
+        finally:
+            document.close()
 
     @staticmethod
     def _rotate_bgr(image: Any, angle: float) -> Any:

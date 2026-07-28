@@ -41,8 +41,34 @@ def _run_ocr_pipeline(source_path: Path) -> dict[str, Any]:
     if ocr_service is None:
         raise RuntimeError("The PaddleOCR service is not initialized.")
 
-    ocr_image, _ = ImageService.prepare_document_array(source_path)
-    return ocr_service.extract_text_from_image(ocr_image)
+    is_pdf = ImageService.is_pdf(source_path)
+    ocr_image, _ = ImageService.prepare_document_array(
+        source_path,
+        canonical_width=(
+            ImageService.PDF_OCR_WIDTH
+            if is_pdf
+            else ImageService.CANONICAL_OCR_WIDTH
+        ),
+        maximum_height=(
+            ImageService.PDF_OCR_MAX_HEIGHT
+            if is_pdf
+            else ImageService.CANONICAL_OCR_MAX_HEIGHT
+        ),
+        pdf_scale=4.0 if is_pdf else 2.0,
+    )
+    native_items = (
+        ImageService.extract_pdf_text_items(
+            source_path,
+            target_width=ocr_image.shape[1],
+            target_height=ocr_image.shape[0],
+        )
+        if is_pdf
+        else []
+    )
+    return ocr_service.extract_text_from_image(
+        ocr_image,
+        native_items=native_items,
+    )
 
 
 @asynccontextmanager

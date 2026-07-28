@@ -1793,8 +1793,27 @@ class DeliveryNoteExtractor:
             # suffix without any external grower database. Keep the common
             # prefix, then extend it only while a strict character majority
             # agrees. This turns SHEKARPL / SHEKAP / SHEKARF into SHEKAR, but
-            # deliberately does nothing for a one-off or two-way conflict.
+            # a two-reading pair is accepted only when one is the other's long
+            # prefix and the difference is a short attached OCR suffix.
             if len(names) < 3:
+                if len(names) == 2:
+                    compact_pair = [
+                        re.sub(r"[^A-Za-z]", "", name).upper()
+                        for name in names
+                    ]
+                    shorter_index = min(
+                        range(2),
+                        key=lambda index: len(compact_pair[index]),
+                    )
+                    shorter = compact_pair[shorter_index]
+                    longer = compact_pair[1 - shorter_index]
+
+                    if (
+                        len(shorter) >= 8
+                        and longer.startswith(shorter)
+                        and len(longer) - len(shorter) <= 4
+                    ):
+                        agreed[tbgr_number] = names[shorter_index]
                 continue
 
             compact = [
@@ -1867,6 +1886,14 @@ class DeliveryNoteExtractor:
                 "",
                 agreed_name,
             ).upper()
+
+            # When multiple rows with the same registration number establish
+            # one grower, a completely missed OCR cell can be restored without
+            # guessing from neighboring rows.
+            if not letters:
+                row["grower_name"] = agreed_name
+                continue
+
             shared_prefix = 0
 
             for left, right in zip(letters, agreed_letters):
@@ -2469,100 +2496,18 @@ class DeliveryNoteExtractor:
 
     @classmethod
     def _repair_purchase_dates(cls, rows: list[dict[str, Any]]) -> None:
-        parsed_dates: list[datetime | None] = []
-
+        """Keep valid OCR dates and expose malformed values for refinement."""
         for row in rows:
             try:
-                parsed_dates.append(
-                    datetime.strptime(
-                        str(row["date_of_purchase"]),
-                        "%d/%m/%y",
-                    )
+                parsed = datetime.strptime(
+                    str(row["date_of_purchase"]),
+                    "%d/%m/%y",
                 )
             except ValueError:
-                parsed_dates.append(None)
-
-        for index, current in enumerate(parsed_dates):
-            if current is None:
+                row["date_of_purchase"] = ""
                 continue
 
-            previous = next(
-                (
-                    value
-                    for value in reversed(parsed_dates[:index])
-                    if value is not None
-                ),
-                None,
-            )
-            following = next(
-                (
-                    value
-                    for value in parsed_dates[index + 1 :]
-                    if value is not None
-                ),
-                None,
-            )
-
-            replacement: datetime | None = None
-
-            if previous is not None and current < previous:
-                replacement = previous
-            elif (
-                previous is not None
-                and following is not None
-                and current > following
-                and following >= previous
-            ):
-                replacement = following
-            elif current.day in {1, 21}:
-                neighbors = [
-                    value
-                    for value in (previous, following)
-                    if value is not None
-                    and value.month == current.month
-                    and value.year == current.year
-                    and value.day == 11
-                ]
-
-                if neighbors:
-                    replacement = neighbors[0]
-
-            if replacement is not None:
-                rows[index]["date_of_purchase"] = replacement.strftime(
-                    "%d/%m/%y"
-                )
-                parsed_dates[index] = replacement
-
-        # Fill rows where OCR dropped the date entirely. Purchase dates run in
-        # non-decreasing order down the note and repeat across adjacent rows,
-        # so the nearest known date above a gap is the safest choice.
-        for index, current in enumerate(parsed_dates):
-            if current is not None:
-                continue
-
-            previous = next(
-                (
-                    value
-                    for value in reversed(parsed_dates[:index])
-                    if value is not None
-                ),
-                None,
-            )
-            following = next(
-                (
-                    value
-                    for value in parsed_dates[index + 1 :]
-                    if value is not None
-                ),
-                None,
-            )
-            replacement = previous if previous is not None else following
-
-            if replacement is not None:
-                rows[index]["date_of_purchase"] = replacement.strftime(
-                    "%d/%m/%y"
-                )
-                parsed_dates[index] = replacement
+            row["date_of_purchase"] = parsed.strftime("%d/%m/%y")
 
     @staticmethod
     def _is_plausible_weight(value: float | None) -> bool:
