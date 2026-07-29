@@ -4,6 +4,9 @@ services:
       context: .
     ports:
       - "4004:8000"
+    environment:
+      OCR_BASIC_USERNAME: ${OCR_BASIC_USERNAME:?Set OCR_BASIC_USERNAME}
+      OCR_BASIC_PASSWORD: ${OCR_BASIC_PASSWORD:?Set OCR_BASIC_PASSWORD}
     volumes:
       - ./uploads:/app/uploads
       - paddleocr-models:/root/.paddlex

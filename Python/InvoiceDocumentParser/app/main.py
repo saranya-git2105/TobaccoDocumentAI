@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import secrets
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Any
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
 from app.services.ocr_service import OcrService
 from app.services.image_service import ImageService
@@ -33,8 +36,45 @@ ALLOWED_EXTENSIONS = ImageService.SUPPORTED_EXTENSIONS
 GENERIC_BINARY_CONTENT_TYPES = {None, "application/octet-stream"}
 
 MAX_FILE_SIZE_BYTES = 15 * 1024 * 1024
+OCR_BASIC_USERNAME_ENV = "OCR_BASIC_USERNAME"
+OCR_BASIC_PASSWORD_ENV = "OCR_BASIC_PASSWORD"
 
 ocr_service: OcrService | None = None
+basic_auth = HTTPBasic()
+
+
+def _basic_auth_credentials() -> tuple[str, str]:
+    username = os.getenv(OCR_BASIC_USERNAME_ENV, "")
+    password = os.getenv(OCR_BASIC_PASSWORD_ENV, "")
+
+    if not username or not password:
+        raise RuntimeError(
+            "Basic authentication is not configured. Set "
+            f"{OCR_BASIC_USERNAME_ENV} and {OCR_BASIC_PASSWORD_ENV}."
+        )
+
+    return username, password
+
+
+def _require_basic_auth(
+    credentials: Annotated[HTTPBasicCredentials, Depends(basic_auth)],
+) -> None:
+    expected_username, expected_password = _basic_auth_credentials()
+    username_matches = secrets.compare_digest(
+        credentials.username.encode("utf-8"),
+        expected_username.encode("utf-8"),
+    )
+    password_matches = secrets.compare_digest(
+        credentials.password.encode("utf-8"),
+        expected_password.encode("utf-8"),
+    )
+
+    if not (username_matches and password_matches):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authentication credentials.",
+            headers={"WWW-Authenticate": "Basic"},
+        )
 
 
 def _run_ocr_pipeline(source_path: Path) -> dict[str, Any]:
@@ -75,6 +115,8 @@ def _run_ocr_pipeline(source_path: Path) -> dict[str, Any]:
 async def lifespan(_: FastAPI):
     global ocr_service
 
+    # Fail startup rather than accidentally exposing OCR without credentials.
+    _basic_auth_credentials()
     UPLOAD_DIRECTORY.mkdir(parents=True, exist_ok=True)
 
     # Load the OCR model once when the application starts.
@@ -122,7 +164,10 @@ def health() -> dict[str, Any]:
     }
 
 
-@app.post("/api/ocr/extract")
+@app.post(
+    "/api/ocr/extract",
+    dependencies=[Depends(_require_basic_auth)],
+)
 async def extract_ocr(
     file: Annotated[
         UploadFile,
