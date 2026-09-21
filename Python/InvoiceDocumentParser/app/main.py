@@ -4,6 +4,7 @@ import asyncio
 import logging
 import os
 import secrets
+import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -13,8 +14,9 @@ from fastapi import Depends, FastAPI, File, HTTPException, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
-from app.services.ocr_service import OcrService
 from app.services.image_service import ImageService
+from app.services.ocr_service import OcrService
+from app.services.tnote_contract import to_pascal_keys
 
 
 BASE_DIRECTORY = Path(__file__).resolve().parent.parent
@@ -81,7 +83,9 @@ def _run_ocr_pipeline(source_path: Path) -> dict[str, Any]:
     if ocr_service is None:
         raise RuntimeError("The PaddleOCR service is not initialized.")
 
+    started = time.perf_counter()
     is_pdf = ImageService.is_pdf(source_path)
+    source = "pdf" if is_pdf else "image"
     ocr_image, _ = ImageService.prepare_document_array(
         source_path,
         canonical_width=(
@@ -105,10 +109,14 @@ def _run_ocr_pipeline(source_path: Path) -> dict[str, Any]:
         if is_pdf
         else []
     )
-    return ocr_service.extract_text_from_image(
+    result = ocr_service.extract_text_from_image(
         ocr_image,
         native_items=native_items,
+        source=source,
     )
+    result["processing_time_seconds"] = round(time.perf_counter() - started, 3)
+    result["page_count"] = ImageService.page_count(source_path)
+    return result
 
 
 @asynccontextmanager
@@ -242,7 +250,7 @@ async def extract_ocr(
             "OCR completed: %d items extracted.",
             len(result.get("items", [])),
         )
-        return result
+        return to_pascal_keys(result)
 
     except HTTPException:
         raise

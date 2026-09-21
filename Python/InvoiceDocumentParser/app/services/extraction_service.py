@@ -230,7 +230,12 @@ class DeliveryNoteExtractor:
     )
 
     @classmethod
-    def extract(cls, items: list[dict[str, Any]]) -> dict[str, Any]:
+    def extract(
+        cls,
+        items: list[dict[str, Any]],
+        *,
+        source: str = "image",
+    ) -> dict[str, Any]:
         items = cls._expand_items(items)
         tokens = cls._to_tokens(items)
         fields = {
@@ -293,6 +298,7 @@ class DeliveryNoteExtractor:
             table_items,
             layout_name=layout_name,
             totals=totals,
+            source=source,
         )
 
         return {
@@ -1268,6 +1274,7 @@ class DeliveryNoteExtractor:
 
         grower_name = " ".join(text_columns["grower_name"]).strip()
         if grower_name:
+            item["grower_name_ocr"] = re.sub(r"\s+", " ", grower_name).strip()
             item["grower_name"] = cls._clean_grower_name(grower_name)
 
         cls._apply_numeric_columns(
@@ -1669,6 +1676,7 @@ class DeliveryNoteExtractor:
         cls._strip_attached_handwriting_markers(rows)
         cls._restore_grower_name_spacing(rows)
         cls._agree_grower_names_by_tbgr(rows)
+        cls._sync_grower_name_ocr(rows)
 
         return [
             row
@@ -1676,6 +1684,14 @@ class DeliveryNoteExtractor:
             if row.get("serial_number") is not None
             and str(row.get("grower_name", "")).strip().lower() != "total"
         ]
+
+    @staticmethod
+    def _sync_grower_name_ocr(rows: list[dict[str, Any]]) -> None:
+        for row in rows:
+            ocr = str(row.get("grower_name_ocr") or "").strip()
+            name = str(row.get("grower_name") or "").strip()
+            if not ocr:
+                row["grower_name_ocr"] = name
 
     # Longest plausible single component of a printed grower name. Anything
     # longer is treated as words OCR ran together rather than as one word.
@@ -2781,6 +2797,7 @@ class DeliveryNoteExtractor:
             return round(sum(values), 2)
 
         computed_weight = column_sum("weight")
+        computed_second_weight = column_sum("second_weight")
         computed_bale = column_sum("bale_value")
         printed_weight = (totals or {}).get("total_weight")
         printed_bale = (totals or {}).get("total_bale_value")
@@ -2817,6 +2834,7 @@ class DeliveryNoteExtractor:
                 if printed_row_count is None
                 else int(printed_row_count) == len(rows)
             ),
+            "computed_total_second_weight": computed_second_weight,
         }
 
     @classmethod
@@ -2826,16 +2844,19 @@ class DeliveryNoteExtractor:
         *,
         layout_name: str = "unknown",
         totals: dict[str, Any] | None = None,
+        source: str = "image",
     ) -> dict[str, Any]:
         if not rows:
             return {
                 "layout": layout_name,
+                "source": source,
                 "rows_extracted": 0,
                 "rows_complete": 0,
                 "quality_percent": 0.0,
                 "issue_rows": [],
                 "totals_check": cls._build_totals_check([], totals),
                 "canonical_ocr_width": ImageService.CANONICAL_OCR_WIDTH,
+                "row_source": "token_geometry",
             }
 
         complete_rows = 0
@@ -2888,12 +2909,14 @@ class DeliveryNoteExtractor:
 
         return {
             "layout": layout_name,
+            "source": source,
             "rows_extracted": row_count,
             "rows_complete": complete_rows,
             "quality_percent": quality_percent,
             "issue_rows": issue_rows[:12],
             "totals_check": cls._build_totals_check(rows, totals),
             "canonical_ocr_width": ImageService.CANONICAL_OCR_WIDTH,
+            "row_source": "token_geometry",
         }
 
     @classmethod
@@ -3389,6 +3412,7 @@ class DeliveryNoteExtractor:
             "serial_number": None,
             "tbgr_number": "",
             "grower_name": "",
+            "grower_name_ocr": "",
             "date_of_purchase": "",
             "lot_number": "",
             "weight": None,

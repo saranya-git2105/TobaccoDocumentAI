@@ -98,6 +98,7 @@ class OcrService:
         image: Any,
         *,
         native_items: list[dict[str, Any]] | None = None,
+        source: str = "image",
     ) -> dict[str, Any]:
         start_time = time.perf_counter()
 
@@ -107,12 +108,15 @@ class OcrService:
         ocr_elapsed = time.perf_counter() - ocr_started
 
         extract_started = time.perf_counter()
-        document = DeliveryNoteExtractor.extract(items)
+        document = DeliveryNoteExtractor.extract(items, source=source)
         protected_date_serials: set[int] = set()
         protected_grade_serials: set[int] = set()
 
         if native_items:
-            native_document = DeliveryNoteExtractor.extract(native_items)
+            native_document = DeliveryNoteExtractor.extract(
+                native_items,
+                source=source,
+            )
             native_rows = native_document.get("items", [])
             ocr_rows = document.get("items", [])
 
@@ -153,7 +157,8 @@ class OcrService:
 
             if refined_items is not items:
                 refined_document = DeliveryNoteExtractor.extract(
-                    refined_items
+                    refined_items,
+                    source=source,
                 )
                 document = self._merge_documents(
                     document,
@@ -936,6 +941,10 @@ class OcrService:
                 document["items"],
                 layout_name=layout_name or "unknown",
                 totals=document.get("totals"),
+                source=str(
+                    (document.get("extraction_meta") or {}).get("source")
+                    or "image"
+                ),
             )
         )
         return document
@@ -1321,6 +1330,10 @@ class OcrService:
                 document["items"],
                 layout_name=layout_name or "unknown",
                 totals=document.get("totals"),
+                source=str(
+                    (document.get("extraction_meta") or {}).get("source")
+                    or "image"
+                ),
             )
         )
         return document
@@ -1525,6 +1538,10 @@ class OcrService:
                     document.get("extraction_meta") or {}
                 ).get("layout", "unknown"),
                 totals=document.get("totals"),
+                source=str(
+                    (document.get("extraction_meta") or {}).get("source")
+                    or "image"
+                ),
             )
         )
         return document
@@ -1690,6 +1707,7 @@ class OcrService:
         row_fields = (
             "tbgr_number",
             "grower_name",
+            "grower_name_ocr",
             "date_of_purchase",
             "lot_number",
             "weight",
@@ -1730,6 +1748,11 @@ class OcrService:
                 ),
             ),
             totals=merged.get("totals"),
+            source=str(
+                (merged.get("extraction_meta") or {}).get("source")
+                or (fallback.get("extraction_meta") or {}).get("source")
+                or "image"
+            ),
         )
         return merged
 
@@ -1753,6 +1776,7 @@ class OcrService:
             for field in (
                 "tbgr_number",
                 "grower_name",
+                "grower_name_ocr",
                 "date_of_purchase",
                 "lot_number",
                 "weight",
@@ -1772,6 +1796,9 @@ class OcrService:
                 refined_name,
             ):
                 merged["grower_name"] = refined_name
+                refined_ocr = str(fallback.get("grower_name_ocr", "")).strip()
+                if refined_ocr:
+                    merged["grower_name_ocr"] = refined_ocr
 
             refined_grade = str(fallback.get("grade", ""))
 
@@ -1799,6 +1826,10 @@ class OcrService:
                     original.get("extraction_meta") or {}
                 ).get("layout", "unknown"),
                 totals=original.get("totals"),
+                source=str(
+                    (original.get("extraction_meta") or {}).get("source")
+                    or "image"
+                ),
             )
         )
         return original

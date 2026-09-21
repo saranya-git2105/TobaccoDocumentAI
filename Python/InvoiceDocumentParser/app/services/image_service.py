@@ -42,6 +42,17 @@ class ImageService:
     def is_supported(cls, path: Path) -> bool:
         return path.suffix.lower() in cls.SUPPORTED_EXTENSIONS
 
+    @classmethod
+    def page_count(cls, path: Path) -> int:
+        if cls.is_pdf(path):
+            document = pdfium.PdfDocument(str(path))
+            try:
+                return max(len(document), 1)
+            finally:
+                document.close()
+
+        return 1
+
     @staticmethod
     def load_image_bgr(source_path: Path) -> Any:
         """Load an image as a BGR array, using Pillow for formats OpenCV cannot read."""

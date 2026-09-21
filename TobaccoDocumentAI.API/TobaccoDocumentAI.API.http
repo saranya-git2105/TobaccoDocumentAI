@@ -1,0 +1,6 @@
+@TobaccoDocumentAI.API_HostAddress = http://localhost:5035
+
+POST {{TobaccoDocumentAI.API_HostAddress}}/api/Documents/extract
+Accept: application/json
+
+###
