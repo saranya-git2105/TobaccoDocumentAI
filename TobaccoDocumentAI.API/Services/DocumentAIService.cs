@@ -60,12 +60,41 @@ public class DocumentAIService : IDocumentAIService
         // 6. Call Document AI
         var response = await client.ProcessDocumentAsync(request, cancellationToken);
         var document = response.Document;
+        LogExtractorEntities(document);
 
-        // 7. Map entities and safely repair deterministic OCR errors.
+        // 7. Map extractor entities only. Do not derive missing numbers or totals.
         var deliveryNote = MapToDeliveryNote(document);
         deliveryNote = DeliveryNotePostProcessor.Process(deliveryNote);
         FinalizeContract(deliveryNote, document, mimeType, started);
         return deliveryNote;
+    }
+
+    private void LogExtractorEntities(Document document)
+    {
+        _logger.LogInformation(
+            "Document AI returned {EntityCount} entities across {PageCount} pages.",
+            document.Entities.Count,
+            document.Pages.Count);
+
+        foreach (var entity in document.Entities)
+        {
+            _logger.LogInformation(
+                "Entity {Type} confidence={Confidence} mention={Mention} normalized={Normalized}",
+                entity.Type,
+                entity.Confidence,
+                entity.MentionText,
+                entity.NormalizedValue?.Text);
+
+            foreach (var property in entity.Properties)
+            {
+                _logger.LogInformation(
+                    "  Property {Type} confidence={Confidence} mention={Mention} normalized={Normalized}",
+                    property.Type,
+                    property.Confidence,
+                    property.MentionText,
+                    property.NormalizedValue?.Text);
+            }
+        }
     }
 
     private DeliveryNote MapToDeliveryNote(Document document)
@@ -104,6 +133,17 @@ public class DocumentAIService : IDocumentAIService
                 case "items":
                 case "line_item":
                     result.Items.Add(MapItem(entity, result.Items.Count));
+                    break;
+                case "totals":
+                case "total":
+                case "totals_row":
+                case "total_row":
+                case "row_count":
+                case "printed_row_count":
+                case "total_weight":
+                case "total_second_weight":
+                case "total_bale_value":
+                    MapTotals(entity, result.Totals);
                     break;
             }
         }
@@ -149,19 +189,19 @@ public class DocumentAIService : IDocumentAIService
                     item.LotNumber = value;
                     break;
                 case "weight":
-                    item.Weight = ParseDecimal(GetNumericText(property));
+                    item.Weight = ParseFirstDecimal(property);
                     break;
                 case "second_weight":
-                    item.SecondWeight = ParseDecimal(value);
+                    item.SecondWeight = ParseFirstDecimal(property);
                     break;
                 case "grade":
                     item.Grade = value;
                     break;
                 case "rate_per_kg":
-                    item.RatePerKg = ParseDecimal(value);
+                    item.RatePerKg = ParseFirstDecimal(property);
                     break;
                 case "bale_value":
-                    item.BaleValue = ParseDecimal(GetNumericText(property));
+                    item.BaleValue = ParseMoney(property);
                     break;
             }
         }
@@ -177,6 +217,82 @@ public class DocumentAIService : IDocumentAIService
         item.GrowerNameOcr = item.GrowerName;
 
         return item;
+    }
+
+    private static void MapTotals(Document.Types.Entity entity, DeliveryNoteTotals totals)
+    {
+        if (entity.Properties.Count > 0)
+        {
+            foreach (var property in entity.Properties)
+            {
+                ApplyTotalField(totals, GetSimpleType(property.Type), property);
+            }
+
+            return;
+        }
+
+        ApplyTotalField(totals, GetSimpleType(entity.Type), entity);
+    }
+
+    private static void ApplyTotalField(
+        DeliveryNoteTotals totals,
+        string type,
+        Document.Types.Entity entity)
+    {
+        switch (type)
+        {
+            case "row_count":
+            case "printed_row_count":
+            case "no_of_rows":
+            case "number_of_rows":
+            case "total_rows":
+                var rowCount = ParseInt(GetValue(entity));
+                if (rowCount is null)
+                {
+                    break;
+                }
+
+                if (type == "printed_row_count")
+                {
+                    totals.PrintedRowCount = rowCount;
+                }
+                else
+                {
+                    totals.RowCount = rowCount.Value;
+                }
+
+                totals.PrintedRowCount ??= rowCount;
+                if (totals.RowCount == 0)
+                {
+                    totals.RowCount = rowCount.Value;
+                }
+
+                break;
+            case "total_weight":
+            case "weight":
+                if (ParseFirstDecimal(entity) is decimal totalWeight)
+                {
+                    totals.TotalWeight = totalWeight;
+                }
+
+                break;
+            case "total_second_weight":
+            case "second_weight":
+                if (ParseFirstDecimal(entity) is decimal totalSecondWeight)
+                {
+                    totals.TotalSecondWeight = totalSecondWeight;
+                }
+
+                break;
+            case "total_bale_value":
+            case "bale_value":
+                if (ParseFirstDecimal(entity) is decimal totalBaleValue)
+                {
+                    totals.TotalBaleValue = totalBaleValue;
+                }
+
+                break;
+        }
     }
 
     private static void FinalizeContract(
@@ -200,25 +316,12 @@ public class DocumentAIService : IDocumentAIService
             ? "pdf"
             : "image";
 
-        deliveryNote.Totals = BuildTotals(deliveryNote.Items);
         deliveryNote.ExtractionMeta = BuildExtractionMeta(
             deliveryNote.Items,
             deliveryNote.Totals,
             source);
         deliveryNote.ProcessingTimeSeconds = Math.Round(started.Elapsed.TotalSeconds, 3);
         deliveryNote.PageCount = Math.Max(document.Pages.Count, 1);
-    }
-
-    private static DeliveryNoteTotals BuildTotals(IReadOnlyCollection<DeliveryNoteItem> items)
-    {
-        return new DeliveryNoteTotals
-        {
-            RowCount = items.Count,
-            PrintedRowCount = items.Count,
-            TotalWeight = ColumnSum(items, item => item.Weight),
-            TotalSecondWeight = ColumnSum(items, item => item.SecondWeight),
-            TotalBaleValue = ColumnSum(items, item => item.BaleValue),
-        };
     }
 
     private static ExtractionMeta BuildExtractionMeta(
@@ -273,9 +376,6 @@ public class DocumentAIService : IDocumentAIService
         }
 
         var rowCount = items.Count;
-        var computedWeight = ColumnSum(items, item => item.Weight);
-        var computedSecondWeight = ColumnSum(items, item => item.SecondWeight);
-        var computedBale = ColumnSum(items, item => item.BaleValue);
 
         return new ExtractionMeta
         {
@@ -289,54 +389,13 @@ public class DocumentAIService : IDocumentAIService
             IssueRows = issueRows.Take(12).ToList(),
             TotalsCheck = new TotalsCheck
             {
-                ComputedTotalWeight = computedWeight,
                 PrintedTotalWeight = totals.TotalWeight,
-                TotalWeightMatches = Compare(computedWeight, totals.TotalWeight, 0.5m),
-                ComputedTotalBaleValue = computedBale,
                 PrintedTotalBaleValue = totals.TotalBaleValue,
-                TotalBaleValueMatches = Compare(computedBale, totals.TotalBaleValue, 1.0m),
                 PrintedRowCount = totals.PrintedRowCount,
-                RowCountMatches = totals.PrintedRowCount is null
-                    ? null
-                    : totals.PrintedRowCount == rowCount,
-                ComputedTotalSecondWeight = computedSecondWeight,
             },
             CanonicalOcrWidth = 0,
             RowSource = "document_ai_entities",
         };
-    }
-
-    private static decimal? ColumnSum(
-        IReadOnlyCollection<DeliveryNoteItem> items,
-        Func<DeliveryNoteItem, decimal?> selector)
-    {
-        if (items.Count == 0)
-        {
-            return null;
-        }
-
-        var values = items
-            .Select(selector)
-            .Where(value => value.HasValue)
-            .Select(value => value!.Value)
-            .ToList();
-
-        if (values.Count != items.Count)
-        {
-            return null;
-        }
-
-        return Math.Round(values.Sum(), 2, MidpointRounding.AwayFromZero);
-    }
-
-    private static bool? Compare(decimal? computed, decimal? printed, decimal tolerance)
-    {
-        if (computed is null || printed is null)
-        {
-            return null;
-        }
-
-        return Math.Abs(computed.Value - printed.Value) <= tolerance;
     }
 
     private static string GetBestTextProperty(
@@ -406,5 +465,68 @@ public class DocumentAIService : IDocumentAIService
             out var result)
             ? result
             : null;
+    }
+
+    private static decimal? ParseFirstDecimal(Document.Types.Entity entity)
+    {
+        foreach (var candidate in new[] { entity.MentionText, entity.NormalizedValue?.Text })
+        {
+            if (string.IsNullOrWhiteSpace(candidate))
+            {
+                continue;
+            }
+
+            var match = System.Text.RegularExpressions.Regex.Match(
+                candidate,
+                @"\d+(?:,\d{3})*(?:\.\d+)?");
+
+            if (!match.Success)
+            {
+                continue;
+            }
+
+            var parsed = ParseDecimal(match.Value);
+            if (parsed is not null)
+            {
+                return parsed;
+            }
+        }
+
+        return null;
+    }
+
+    private static decimal? ParseMoney(Document.Types.Entity entity)
+    {
+        foreach (var candidate in new[] { entity.MentionText, entity.NormalizedValue?.Text })
+        {
+            if (string.IsNullOrWhiteSpace(candidate))
+            {
+                continue;
+            }
+
+            var match = System.Text.RegularExpressions.Regex.Match(
+                candidate,
+                @"\d+(?:,\d{3})*(?:\.\d+)?");
+
+            if (!match.Success)
+            {
+                continue;
+            }
+
+            var number = match.Value.Replace(",", "");
+            var decimalPoint = number.IndexOf('.');
+            if (decimalPoint >= 0 && number.Length - decimalPoint - 1 > 2)
+            {
+                number = number[..(decimalPoint + 3)];
+            }
+
+            var parsed = ParseDecimal(number);
+            if (parsed is not null)
+            {
+                return parsed;
+            }
+        }
+
+        return null;
     }
 }
