@@ -1,2 +1,52 @@
-# Google Cloud service account keys stay on this machine.
-/*-*.json
+# .NET build and IDE files
+**/bin/
+**/obj/
+.vs/
+*.user
+*.suo
+
+# Python environments, caches, and tooling
+**/.venv/
+**/venv/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Node/Vite build files
+**/node_modules/
+**/dist/
+**/dist-ssr/
+*.local
+
+# Environment files and secrets
+.env
+.env.*
+!.env.example
+tobacco-delivery-note-ai-e926280e1d7d.json
+boxwood-reach-510312-e4-2f89fdf72d92.json
+*service-account*.json
+*credentials*.json
+
+# Logs and generated runtime output
+*.log
+logs/
+**/uploads/*
+**/output/*
+**/build_output/
+**/test_documents/*
+
+# Preserve placeholder files in generated directories
+!**/uploads/.gitkeep
+!**/output/.gitkeep
+!**/test_documents/.gitkeep
+
+# Editor and operating-system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+Desktop.ini
