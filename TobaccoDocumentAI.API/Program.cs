@@ -14,6 +14,8 @@ builder.Services.Configure<GoogleDocumentAIOptions>(
     builder.Configuration.GetSection(GoogleDocumentAIOptions.SectionName));
 builder.Services.Configure<BasicAuthOptions>(
     builder.Configuration.GetSection(BasicAuthOptions.SectionName));
+builder.Services.Configure<StringValueJsonOptions>(
+    builder.Configuration.GetSection(StringValueJsonOptions.SectionName));
 
 builder.Services.AddScoped<IDocumentAIService, DocumentAIService>();
 builder.Services.AddOpenApi();
@@ -30,16 +32,15 @@ builder.Services.AddCors(options =>
 
 var app = builder.Build();
 
-if (app.Environment.IsDevelopment())
-{
+// if (app.Environment.IsDevelopment())
     app.MapOpenApi();
     app.UseSwaggerUI(options =>
     {
         options.SwaggerEndpoint("/openapi/v1.json", "v1");
     });
-}
 
 app.UseCors("ReactPolicy");
+app.UseMiddleware<StringValueJsonMiddleware>();
 app.UseMiddleware<BasicAuthenticationMiddleware>();
 
 app.MapControllers();
