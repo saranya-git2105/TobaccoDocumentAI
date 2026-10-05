@@ -1,3 +1,4 @@
+using TobaccoDocumentAI.API.Authentication;
 using TobaccoDocumentAI.API.Configuration;
 using TobaccoDocumentAI.API.Services;
 
@@ -11,6 +12,8 @@ builder.Services.AddControllers()
     });
 builder.Services.Configure<GoogleDocumentAIOptions>(
     builder.Configuration.GetSection(GoogleDocumentAIOptions.SectionName));
+builder.Services.Configure<BasicAuthOptions>(
+    builder.Configuration.GetSection(BasicAuthOptions.SectionName));
 
 builder.Services.AddScoped<IDocumentAIService, DocumentAIService>();
 builder.Services.AddOpenApi();
@@ -37,6 +40,7 @@ if (app.Environment.IsDevelopment())
 }
 
 app.UseCors("ReactPolicy");
+app.UseMiddleware<BasicAuthenticationMiddleware>();
 
 app.MapControllers();
 
